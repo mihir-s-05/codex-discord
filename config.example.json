@@ -1,0 +1,20 @@
+{
+  "discord": {
+    "largeImageKey": "codex",
+    "largeImageText": "Codex",
+    "smallImageKey": "terminal",
+    "smallImageText": "Windows"
+  },
+  "privacy": {
+    "showRepo": true,
+    "showBranch": true,
+    "showToolName": true
+  },
+  "behavior": {
+    "onSessionEnd": "clear",
+    "updateDebounceMs": 500
+  },
+  "logging": {
+    "level": "INFO"
+  }
+}
