@@ -38,6 +38,7 @@ const (
 	defaultClientID         = "1465420195911831593"
 	stateLockTimeout        = 2 * time.Second
 	connectionCheckInterval = 30 * time.Second
+	staleSessionTimeout     = 2 * time.Minute
 )
 
 const (
@@ -208,7 +209,17 @@ func setCmd(args []string) {
 	cfg, _, log := loadConfig(*project)
 	defer log.Close()
 
-	stateFile, _ := loadState()
+	lock, err := acquireStateLock()
+	if err != nil {
+		log.Errorf("Failed to acquire state lock: %v", err)
+		return
+	}
+	defer lock.Release()
+
+	stateFile, ok := loadStateOnce()
+	if !ok {
+		stateFile = State{}
+	}
 
 	startTimestamp := determineStartTimestamp(stateFile, *startTs)
 	nowMs := time.Now().UnixMilli()
@@ -223,43 +234,25 @@ func setCmd(args []string) {
 	stateFile.DesiredState = *state
 	stateFile.DesiredUpdatedMs = nowMs
 	stateFile.ClearRequested = false
-	if stateFile.DaemonPid == 0 {
-		stateFile.StopDaemon = false
-	}
+	stateFile.StopDaemon = false
 	_ = saveState(stateFile)
 
-	if isDaemonRunning(stateFile) {
-		log.Debugf("Daemon running; wrote desired state only")
-		return
-	}
-
-	staleMs := int64(staleRefreshMinutes) * 60 * 1000
-	if shouldSkipUpdate(stateFile, *details, *state, nowMs, debounceMs, staleMs) {
-		log.Debugf("Skipping update due to debounce")
-		return
-	}
-
-	err := setActivity(cfg, *details, *state, startTimestamp, *debug, log)
-	if err != nil {
-		log.Errorf("Failed to set activity: %v", err)
-		stateFile.LastDetails = *details
-		stateFile.LastState = *state
-		stateFile.LastUpdatedMs = 0
-		_ = saveState(stateFile)
-		if *debug {
-			fmt.Fprintln(os.Stdout, "set error:", err)
+	if !isDaemonRunning(stateFile) {
+		if err := startDaemonDetached(*project, &stateFile); err != nil {
+			log.Errorf("Failed to start daemon: %v", err)
+			staleMs := int64(staleRefreshMinutes) * 60 * 1000
+			if shouldSkipUpdate(stateFile, *details, *state, nowMs, debounceMs, staleMs) {
+				log.Debugf("Skipping update due to debounce")
+				return
+			}
+			if err := setActivity(cfg, *details, *state, startTimestamp, *debug, log); err != nil {
+				log.Errorf("Failed to set activity: %v", err)
+				return
+			}
+		} else {
+			_ = saveState(stateFile)
 		}
-		return
 	}
-
-	if *debug {
-		fmt.Fprintln(os.Stdout, "set ok")
-	}
-
-	stateFile.LastDetails = *details
-	stateFile.LastState = *state
-	stateFile.LastUpdatedMs = nowMs
-	_ = saveState(stateFile)
 }
 
 func clearCmd(args []string) {
@@ -270,7 +263,17 @@ func clearCmd(args []string) {
 	cfg, _, log := loadConfig(*project)
 	defer log.Close()
 
-	stateFile, _ := loadState()
+	lock, err := acquireStateLock()
+	if err != nil {
+		log.Errorf("Failed to acquire state lock: %v", err)
+		return
+	}
+	defer lock.Release()
+
+	stateFile, ok := loadStateOnce()
+	if !ok {
+		stateFile = State{}
+	}
 	stateFile.ClearRequested = true
 	stateFile.Active = false
 	stateFile.DesiredDetails = ""
@@ -375,6 +378,35 @@ func daemonStopCmd() {
 	stateFile.StopDaemon = true
 	stateFile.Active = false
 	_ = saveStateWithLock(stateFile, lock)
+}
+
+func startDaemonDetached(projectPath string, stateFile *State) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	cmdArgs := []string{"daemon", "--run"}
+	if strings.TrimSpace(projectPath) != "" {
+		cmdArgs = append(cmdArgs, "--project", projectPath)
+	}
+
+	cmd := exec.Command(exe, cmdArgs...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.DETACHED_PROCESS,
+		HideWindow:    true,
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	_ = cmd.Process.Release()
+
+	if stateFile != nil {
+		stateFile.DaemonPid = cmd.Process.Pid
+		stateFile.DaemonStartedMs = time.Now().UnixMilli()
+		stateFile.StopDaemon = false
+	}
+	return nil
 }
 
 func defaultConfig() Config {
@@ -1233,14 +1265,14 @@ func runDaemon(projectPath string) {
 		if stateFile.DesiredDetails == "" && stateFile.DesiredState == "" {
 			if stopRequested {
 				log.Debugf("Stop signal received, daemon exiting")
-				cleanupDaemon(conn, false)
+				cleanupDaemon(conn, true)
 				return
 			}
 			if stateFile.DesiredUpdatedMs > 0 {
 				idleFor := time.Since(time.UnixMilli(stateFile.DesiredUpdatedMs))
 				if idleFor > time.Duration(daemonIdleMinutes)*time.Minute {
 					log.Debugf("Idle timeout reached, daemon exiting")
-					cleanupDaemon(conn, false)
+					cleanupDaemon(conn, true)
 					return
 				}
 			}
@@ -1259,6 +1291,27 @@ func runDaemon(projectPath string) {
 		lastConnCheck = time.Now()
 
 		nowMs := time.Now().UnixMilli()
+
+		// Safety net: if watcher hasn't sent an update in staleSessionTimeout,
+		// it likely crashed or exited — clear the ghost presence
+		if stateFile.DesiredUpdatedMs > 0 && nowMs-stateFile.DesiredUpdatedMs > staleSessionTimeout.Milliseconds() {
+			log.Debugf("Desired state stale for %d ms, clearing presence", nowMs-stateFile.DesiredUpdatedMs)
+			if err := sendClear(conn, false); err == nil {
+				stateFile.Active = false
+				stateFile.DesiredDetails = ""
+				stateFile.DesiredState = ""
+				stateFile.LastDetails = ""
+				stateFile.LastState = ""
+				stateFile.LastUpdatedMs = nowMs
+				_ = saveState(stateFile)
+			} else {
+				log.Debugf("Stale clear failed: %v", err)
+				_ = conn.Close()
+				conn = nil
+			}
+			continue
+		}
+
 		staleMs := int64(staleRefreshMinutes) * 60 * 1000
 		debounceMs := cfg.Behavior.UpdateDebounce
 		if debounceMs <= 0 {
@@ -1283,7 +1336,7 @@ func runDaemon(projectPath string) {
 		_ = saveState(stateFile)
 		if stopRequested {
 			log.Debugf("Stop signal received after update, daemon exiting")
-			cleanupDaemon(conn, false)
+			cleanupDaemon(conn, true)
 			return
 		}
 	}

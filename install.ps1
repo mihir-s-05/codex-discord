@@ -13,9 +13,20 @@ $installRoot = if ($InstallDir) { $InstallDir } else { Join-Path $env:LOCALAPPDA
 $installHooksDir = Join-Path $installRoot 'hooks'
 $installedHelperPath = Join-Path $installRoot 'codex-presence.exe'
 $installedWatcherPath = Join-Path $installHooksDir 'presence.ps1'
+$installedRunnerPath = Join-Path $installRoot 'run-watcher.vbs'
 
 function Ensure-InstallLayout {
     New-Item -ItemType Directory -Force -Path $installHooksDir -ErrorAction SilentlyContinue | Out-Null
+}
+
+function Write-Runner([string]$watcherPath) {
+    $escaped = $watcherPath.Replace('"', '""')
+    $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""' + $escaped + '""'
+    $vbs = @"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "$cmd", 0, False
+"@
+    Set-Content -Path $installedRunnerPath -Value $vbs -Encoding ASCII
 }
 
 function Copy-Artifacts {
@@ -37,9 +48,12 @@ function Copy-Artifacts {
         Where-Object { $_.Path -and ($_.Path -eq $installedHelperPath) } |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 300
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $installRoot 'state.json')
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $installRoot 'state.lock')
 
     Copy-Item -Force -Path $builtHelperPath -Destination $installedHelperPath
     Copy-Item -Force -Path $repoWatcherPath -Destination $installedWatcherPath
+    Write-Runner $installedWatcherPath
 }
 
 function Enable-Autostart([string]$watcherPath) {
@@ -47,14 +61,16 @@ function Enable-Autostart([string]$watcherPath) {
     $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($existing) { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null }
 
-    $args = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcherPath`""
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $args
+    Write-Runner $watcherPath
+    $wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
+    $args = "//B //NoLogo `"$installedRunnerPath`""
+    $action = New-ScheduledTaskAction -Execute $wscript -Argument $args
     $trigger = New-ScheduledTaskTrigger -AtLogOn
 
     $principalUser = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { $env:USERNAME }
     $principal = New-ScheduledTaskPrincipal -UserId $principalUser -LogonType Interactive -RunLevel Limited
 
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden
 
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
     Write-Host "Enabled autostart (Scheduled Task '$taskName')"
@@ -95,11 +111,12 @@ if ($EnableAutostart) {
 
 if ($StartWatcher) {
     Write-Host 'Starting watcher in a background process...'
-    Start-Process -FilePath 'powershell' -ArgumentList @(
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-WindowStyle', 'Hidden',
-        '-File', $installedWatcherPath
+    Write-Runner $installedWatcherPath
+    $wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
+    Start-Process -FilePath $wscript -ArgumentList @(
+        '//B',
+        '//NoLogo',
+        $installedRunnerPath
     ) -WindowStyle Hidden | Out-Null
     Write-Host 'Watcher started.'
 }

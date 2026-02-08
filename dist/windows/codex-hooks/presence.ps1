@@ -4,7 +4,7 @@ $debugEnabled = $env:CODEX_PRESENCE_DEBUG -eq '1'
 $logDir = $null
 $logPath = $null
 
-$mutex = New-Object System.Threading.Mutex($false, 'Local\\CodexPresenceWatcher')
+$mutex = [System.Threading.Mutex]::new($false, 'CodexPresenceWatcher')
 if (-not $mutex.WaitOne(0)) { return }
 
 function Initialize-Logging {
@@ -95,36 +95,6 @@ function Resolve-HelperPath {
     return $null
 }
 
-function Start-Daemon([string]$helper, [string]$projectRoot) {
-    if (-not $helper) {
-        Write-ErrorLog "Start-Daemon: helper path is empty"
-        return
-    }
-    $daemonArgs = @('daemon')
-    if ($projectRoot) { $daemonArgs += @('--project', $projectRoot) }
-    try {
-        $proc = Start-Process -FilePath $helper -ArgumentList $daemonArgs -WindowStyle Hidden -PassThru -ErrorAction Stop
-        if ($proc) {
-            Write-DebugLog "Started daemon with PID $($proc.Id)"
-        }
-    } catch {
-        Write-ErrorLog "Failed to start daemon: $_"
-    }
-}
-
-function Stop-Daemon([string]$helper) {
-    if (-not $helper) {
-        Write-ErrorLog "Stop-Daemon: helper path is empty"
-        return
-    }
-    try {
-        $output = & $helper 'daemon-stop' 2>&1
-        Write-DebugLog "daemon-stop output: $output"
-    } catch {
-        Write-ErrorLog "Failed to stop daemon: $_"
-    }
-}
-
 function Get-GitRoot([string]$cwd) {
     if (-not $cwd) { return $null }
     $gitRoot = & git -C $cwd rev-parse --show-toplevel 2>$null
@@ -137,16 +107,6 @@ function Get-GitBranch([string]$projectRoot) {
     $branch = & git -C $projectRoot rev-parse --abbrev-ref HEAD 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $branch) { return $null }
     return $branch.Trim()
-}
-
-function Test-CodexRunning {
-    try {
-        $proc = Get-Process -Name 'codex' -ErrorAction SilentlyContinue
-        if ($proc) { return $true }
-        return $false
-    } catch {
-        return $null
-    }
 }
 
 function Get-LatestSessionFile([string]$sessionsRoot) {
@@ -205,7 +165,9 @@ function Send-Update([string]$helper, [string]$details, [string]$state, [string]
     if (-not $helper) { return }
     if (-not $details) { return }
     if (-not $state) { return }
-    if ($script:lastState -eq $state -and $script:lastDetails -eq $details) { return }
+    $now = Get-Date
+    $heartbeat = $script:lastUpdateTime -and ($now - $script:lastUpdateTime).TotalSeconds -ge 30
+    if (-not $heartbeat -and $script:lastState -eq $state -and $script:lastDetails -eq $details) { return }
     $args = @('set', '--details', $details, '--state', $state)
     if ($startTs -gt 0) { $args += @('--start-ts', $startTs) }
     if ($projectRoot) { $args += @('--project', $projectRoot) }
@@ -213,6 +175,7 @@ function Send-Update([string]$helper, [string]$details, [string]$state, [string]
         & $helper @args | Out-Null
         $script:lastState = $state
         $script:lastDetails = $details
+        $script:lastUpdateTime = $now
         Write-DebugLog "sent set state=$state"
     } catch {
         Write-ErrorLog "Failed to send set: $_"
@@ -245,38 +208,11 @@ $details = 'Codex'
 $startTs = 0
 $config = Get-DefaultConfig
 $lastToolName = $null
-$codexWasRunning = $false
 $lastSessionScan = Get-Date
+$lastNewContentTime = $null
+$script:lastUpdateTime = $null
 
 while ($true) {
-    $codexRunning = Test-CodexRunning
-    if ($codexRunning -eq $true) {
-        $codexWasRunning = $true
-    } elseif ($codexRunning -eq $false -and $codexWasRunning) {
-        $onSessionEnd = $config.behavior.onSessionEnd
-        if ($onSessionEnd -eq 'idle') {
-            Send-Update -helper $helper -details $details -state 'Idle' -projectRoot $projectRoot -startTs $startTs
-        } else {
-            Send-Clear -helper $helper -projectRoot $projectRoot
-        }
-        Stop-Daemon $helper
-        Write-DebugLog 'Codex not running; cleared presence'
-
-        $codexWasRunning = $false
-        if ($currentFile -and (Test-Path $currentFile)) {
-            $offset = (Get-Item $currentFile).Length
-        } else {
-            $offset = 0
-        }
-        $projectRoot = $null
-        $details = 'Codex'
-        $startTs = 0
-        $config = Get-DefaultConfig
-        $lastToolName = $null
-    } elseif ($codexRunning -eq $null) {
-        Write-DebugLog 'Test-CodexRunning failed; keeping watcher alive'
-    }
-
     $scanNeeded = ($null -eq $currentFile) -or ((Get-Date) - $lastSessionScan).TotalSeconds -ge 2
     if ($scanNeeded) {
         $latest = Get-LatestSessionFile $sessionsRoot
@@ -285,14 +221,15 @@ while ($true) {
             Start-Sleep -Milliseconds 500
             continue
         }
-        if (-not $codexWasRunning) {
-            $ageSeconds = ((Get-Date) - $latest.LastWriteTime).TotalSeconds
-            if ($ageSeconds -gt 10) {
-                Start-Sleep -Milliseconds 500
-                continue
-            }
+        $ageSeconds = ((Get-Date) - $latest.LastWriteTime).TotalSeconds
+        if ($ageSeconds -gt 10 -and -not $currentFile) {
+            Start-Sleep -Milliseconds 500
+            continue
         }
         if ($null -eq $currentFile -or $latest.FullName -ne $currentFile) {
+            if ($script:lastState -and $currentFile) {
+                Send-Clear -helper $helper -projectRoot $projectRoot
+            }
             $currentFile = $latest.FullName
             $offset = 0
             $projectRoot = $null
@@ -300,11 +237,18 @@ while ($true) {
             $startTs = 0
             $lastToolName = $null
             $config = Get-DefaultConfig
+            $lastNewContentTime = $null
+            $script:lastState = $null
+            $script:lastDetails = $null
+            $script:lastUpdateTime = $null
             Write-DebugLog "Now watching $currentFile"
         }
     }
 
     $lines = Read-NewLines $currentFile ([ref]$offset)
+    if ($lines.Count -gt 0) {
+        $lastNewContentTime = Get-Date
+    }
     foreach ($line in $lines) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         $entry = $null
@@ -318,7 +262,6 @@ while ($true) {
 
         switch ($entry.type) {
             'session_meta' {
-                $codexWasRunning = $true
                 $cwd = $entry.payload.cwd
                 $projectRoot = $env:CODEX_PROJECT_DIR
                 if (-not $projectRoot) {
@@ -332,7 +275,6 @@ while ($true) {
                 } catch {
                     $startTs = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
                 }
-                Start-Daemon $helper $projectRoot
                 Send-Update -helper $helper -details $details -state 'Idle' -projectRoot $projectRoot -startTs $startTs
             }
             'turn_context' {
@@ -387,6 +329,18 @@ while ($true) {
                     }
                 }
             }
+        }
+    }
+
+    if ($script:lastState -and $lastNewContentTime) {
+        $inactiveSeconds = ((Get-Date) - $lastNewContentTime).TotalSeconds
+        if ($inactiveSeconds -gt 30) {
+            Send-Clear -helper $helper -projectRoot $projectRoot
+            $script:lastState = $null
+            $script:lastDetails = $null
+            $script:lastUpdateTime = $null
+            $lastNewContentTime = $null
+            Write-DebugLog "Session inactive for ${inactiveSeconds}s; cleared presence"
         }
     }
 
