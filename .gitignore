@@ -10,6 +10,7 @@ Desktop.ini
 *.test
 *.out
 !dist/**/*.exe
+dist/windows/codex-presence.exe
 
 bin/
 

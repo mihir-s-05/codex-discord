@@ -45,7 +45,6 @@ function Copy-Artifacts {
     Stop-ScheduledTask -TaskName 'CodexPresence' -ErrorAction SilentlyContinue | Out-Null
     if (Test-Path $installedHelperPath) { & $installedHelperPath 'daemon-stop' 2>$null | Out-Null }
     Get-Process -Name 'codex-presence' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -and ($_.Path -eq $installedHelperPath) } |
         Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 300
     Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $installRoot 'state.json')

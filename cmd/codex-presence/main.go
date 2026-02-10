@@ -217,7 +217,8 @@ func setCmd(args []string) {
 	defer lock.Release()
 
 	stateFile, ok := loadStateOnce()
-	if !ok {
+	stateLoadFailed := !ok
+	if stateLoadFailed {
 		stateFile = State{}
 	}
 
@@ -237,7 +238,11 @@ func setCmd(args []string) {
 	stateFile.StopDaemon = false
 	_ = saveState(stateFile)
 
-	if !isDaemonRunning(stateFile) {
+	daemonAlive := isDaemonRunning(stateFile)
+	if !daemonAlive && stateLoadFailed {
+		daemonAlive = isAnyDaemonProcessRunning()
+	}
+	if !daemonAlive {
 		if err := startDaemonDetached(*project, &stateFile); err != nil {
 			log.Errorf("Failed to start daemon: %v", err)
 			staleMs := int64(staleRefreshMinutes) * 60 * 1000
@@ -685,11 +690,11 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return nil
 	}
 
-	_ = os.Remove(path)
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := os.WriteFile(path, data, perm); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
 	}
+	_ = os.Remove(tmpPath)
 	return nil
 }
 
@@ -728,6 +733,20 @@ func clearStateWithLock() error {
 		lock.Release()
 	}
 	return err
+}
+
+func lockedSaveState(mutate func(s *State)) error {
+	lock, err := acquireStateLock()
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	st, ok := loadStateOnce()
+	if !ok {
+		st = State{}
+	}
+	mutate(&st)
+	return saveState(st)
 }
 
 func determineStartTimestamp(state State, startFlag int64) int64 {
@@ -815,6 +834,33 @@ func isProcessRunningWithName(pid int, expectedName string) bool {
 		if int(entry.ProcessID) == pid {
 			exe := windows.UTF16ToString(entry.ExeFile[:])
 			return strings.ToLower(exe) == expectedLower
+		}
+		if err := windows.Process32Next(snapshot, &entry); err != nil {
+			break
+		}
+	}
+	return false
+}
+
+func isAnyDaemonProcessRunning() bool {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(snapshot)
+
+	myPid := uint32(os.Getpid())
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	if err := windows.Process32First(snapshot, &entry); err != nil {
+		return false
+	}
+	for {
+		if entry.ProcessID != myPid {
+			exe := windows.UTF16ToString(entry.ExeFile[:])
+			if strings.EqualFold(exe, "codex-presence.exe") {
+				return true
+			}
 		}
 		if err := windows.Process32Next(snapshot, &entry); err != nil {
 			break
@@ -1191,6 +1237,13 @@ func runDaemon(projectPath string) {
 	cfg, _, log := loadConfig(projectPath)
 	defer log.Close()
 
+	stateFile, _ := loadState()
+	if stateFile.DaemonPid > 0 && stateFile.DaemonPid != os.Getpid() &&
+		isProcessRunningWithName(stateFile.DaemonPid, "codex-presence.exe") {
+		log.Debugf("Another daemon (PID %d) is already running; exiting", stateFile.DaemonPid)
+		return
+	}
+
 	cleanupDaemon := func(conn net.Conn, clearPresence bool) {
 		if conn != nil {
 			if clearPresence {
@@ -1232,9 +1285,14 @@ func runDaemon(projectPath string) {
 		stopRequested := stateFile.StopDaemon
 
 		if stateFile.DaemonPid != os.Getpid() {
-			stateFile.DaemonPid = os.Getpid()
-			stateFile.DaemonStartedMs = time.Now().UnixMilli()
-			_ = saveState(stateFile)
+			myPid := os.Getpid()
+			nowStarted := time.Now().UnixMilli()
+			_ = lockedSaveState(func(s *State) {
+				s.DaemonPid = myPid
+				s.DaemonStartedMs = nowStarted
+			})
+			stateFile.DaemonPid = myPid
+			stateFile.DaemonStartedMs = nowStarted
 		}
 
 		if stateFile.ClearRequested {
@@ -1244,11 +1302,13 @@ func runDaemon(projectPath string) {
 			}
 			lastConnCheck = time.Now()
 			if err := sendClear(conn, false); err == nil {
-				stateFile.ClearRequested = false
-				stateFile.LastDetails = ""
-				stateFile.LastState = ""
-				stateFile.LastUpdatedMs = time.Now().UnixMilli()
-				_ = saveState(stateFile)
+				clearNow := time.Now().UnixMilli()
+				_ = lockedSaveState(func(s *State) {
+					s.ClearRequested = false
+					s.LastDetails = ""
+					s.LastState = ""
+					s.LastUpdatedMs = clearNow
+				})
 				if stopRequested {
 					log.Debugf("Stop signal received after clear, daemon exiting")
 					cleanupDaemon(conn, false)
@@ -1280,8 +1340,11 @@ func runDaemon(projectPath string) {
 		}
 
 		if stateFile.StartTimestamp == 0 {
-			stateFile.StartTimestamp = time.Now().Unix()
-			_ = saveState(stateFile)
+			startNow := time.Now().Unix()
+			_ = lockedSaveState(func(s *State) {
+				s.StartTimestamp = startNow
+			})
+			stateFile.StartTimestamp = startNow
 		}
 
 		conn = ensureDiscordConn(conn, cfg, log)
@@ -1297,13 +1360,14 @@ func runDaemon(projectPath string) {
 		if stateFile.DesiredUpdatedMs > 0 && nowMs-stateFile.DesiredUpdatedMs > staleSessionTimeout.Milliseconds() {
 			log.Debugf("Desired state stale for %d ms, clearing presence", nowMs-stateFile.DesiredUpdatedMs)
 			if err := sendClear(conn, false); err == nil {
-				stateFile.Active = false
-				stateFile.DesiredDetails = ""
-				stateFile.DesiredState = ""
-				stateFile.LastDetails = ""
-				stateFile.LastState = ""
-				stateFile.LastUpdatedMs = nowMs
-				_ = saveState(stateFile)
+				_ = lockedSaveState(func(s *State) {
+					s.Active = false
+					s.DesiredDetails = ""
+					s.DesiredState = ""
+					s.LastDetails = ""
+					s.LastState = ""
+					s.LastUpdatedMs = nowMs
+				})
 			} else {
 				log.Debugf("Stale clear failed: %v", err)
 				_ = conn.Close()
@@ -1330,10 +1394,13 @@ func runDaemon(projectPath string) {
 			continue
 		}
 
-		stateFile.LastDetails = stateFile.DesiredDetails
-		stateFile.LastState = stateFile.DesiredState
-		stateFile.LastUpdatedMs = nowMs
-		_ = saveState(stateFile)
+		sentDetails := stateFile.DesiredDetails
+		sentState := stateFile.DesiredState
+		_ = lockedSaveState(func(s *State) {
+			s.LastDetails = sentDetails
+			s.LastState = sentState
+			s.LastUpdatedMs = nowMs
+		})
 		if stopRequested {
 			log.Debugf("Stop signal received after update, daemon exiting")
 			cleanupDaemon(conn, true)
